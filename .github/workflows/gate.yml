@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   gate:
-    name: gate
+    name: ${{ (github.event.action != 'edited' || github.event.changes.base.ref.from != '') && 'gate' || 'gate-edit' }}
     # [skip-gate] in the PR title makes this job SKIP → experiment A (does skipped satisfy?)
     if: ${{ github.event_name == 'push' || !contains(github.event.pull_request.title, '[skip-gate]') }}
     runs-on: ubuntu-latest
