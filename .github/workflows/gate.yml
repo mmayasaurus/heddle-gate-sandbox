@@ -4,27 +4,44 @@ on:
     types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
-permissions: {}
+permissions:
+  checks: write
+  statuses: read
+  contents: read
 concurrency:
-  group: gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: gate-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action != 'edited' || github.event.changes.base.ref.from != '') && 'run' || 'edit' }}
+  # commit/retarget cancel superseded; title/body edits (echoes) never cancel
+  cancel-in-progress: ${{ github.event.action != 'edited' || github.event.changes.base.ref.from != '' }}
 jobs:
   gate:
     name: gate
-    # [skip-gate] in the PR title makes this job SKIP → experiment A (does skipped satisfy?)
-    if: ${{ github.event_name == 'push' || !contains(github.event.pull_request.title, '[skip-gate]') }}
     runs-on: ubuntu-latest
     steps:
-      - name: event context (for the changes.base discriminator experiment)
+      - name: real check or echo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          IS_EDIT: ${{ github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.base.ref.from == '' }}
+          TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "event=${{ github.event_name }} action=${{ github.event.action }}"
-          echo "changes.base.ref.from=[${{ github.event.changes.base.ref.from }}]"
-          echo "title=${{ github.event.pull_request.title }}"
-      - name: verdict (title [fail] → red, [slow] → 40s then green, else green)
-        run: |
-          T="${{ github.event.pull_request.title }}"
-          case "$T" in
-            *"[fail]"*) echo "RED by title"; exit 1 ;;
-            *"[slow]"*) echo "sleeping 40s"; sleep 40; echo "green after slow"; exit 0 ;;
-            *) echo "GREEN"; exit 0 ;;
-          esac
+          set -eu
+          if [ "$IS_EDIT" = "true" ]; then
+            echo "ECHO path: reading last real verdict (gate-verdict marker) for $SHA"
+            CONC=$(gh api "repos/$REPO/commits/$SHA/check-runs" \
+              --jq '[.check_runs[]|select(.name=="gate-verdict")]|sort_by(.started_at)|last|.conclusion // "none"')
+            echo "last real verdict = $CONC"
+            case "$CONC" in
+              success) echo "echoing GREEN"; exit 0 ;;
+              none)    echo "no prior real verdict yet — fail closed (a commit run will supersede)"; exit 1 ;;
+              *)       echo "echoing prior RED ($CONC) — not masking"; exit 1 ;;
+            esac
+          fi
+          # commit/retarget: compute the REAL verdict, publish it green/red AND record a gate-verdict marker
+          RC=0
+          case "$TITLE" in *"[fail]"*) RC=1 ;; esac
+          if [ "$RC" = "0" ]; then MARK=success; else MARK=failure; fi
+          gh api "repos/$REPO/check-runs" -X POST -f name=gate-verdict -f head_sha="$SHA" \
+            -f status=completed -f conclusion="$MARK" >/dev/null
+          echo "real verdict = $MARK (recorded as gate-verdict marker)"
+          exit $RC
